@@ -498,20 +498,102 @@ def build_ee_tracking_cost_batched_timevarying(
     return QuadCost(C_seq, c_seq)
 
 
+def build_joint_tracking_cost_batched_timevarying(
+    x_batch: torch.Tensor,
+    T: int,
+    goal_timesteps: torch.Tensor,
+    joint_goals: torch.Tensor,
+    dynamics: PinocchioPandaDynamics,
+    q_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    u_weight: torch.Tensor,
+):
+    """Batched, time-varying QuadCost for joint-space tracking.
+
+    Cost per step: 0.5*q_w*||q - q_des||^2 + 0.5*v_w*||v||^2 + 0.5*u_w*||u||^2
+
+    Args:
+      x_batch: [B, n_state]
+      T: horizon length
+      goal_timesteps: [K] long tensor (absolute/horizon-relative indices)
+      joint_goals: [B, K, n] desired joint angles
+      q_weight, v_weight, u_weight: scalar tensors
+    Returns QuadCost with C: [T, B, n_tau, n_tau], c: [T, B, n_tau]
+    """
+    assert x_batch.ndimension() == 2
+    B, n_state = x_batch.shape
+    device, dtype = x_batch.device, x_batch.dtype
+
+    n = dynamics.nv
+    assert n_state == dynamics.nq + dynamics.nv
+
+    assert q_weight.ndimension() == 0
+    assert v_weight.ndimension() == 0
+    assert u_weight.ndimension() == 0
+
+    K = goal_timesteps.size(0)
+    assert joint_goals.shape == (B, K, n)
+
+    # Sort schedule indices once
+    sort_idx = torch.argsort(goal_timesteps)
+    ts_sorted = goal_timesteps[sort_idx]
+
+    C_seq = []
+    c_seq = []
+    Iq = torch.eye(n, device=device, dtype=dtype)
+    Iv = torch.eye(n, device=device, dtype=dtype)
+    Iu = torch.eye(n, device=device, dtype=dtype)
+
+    for t in range(T):
+        # Select current goal index
+        idx = None
+        for k in range(K):
+            if t <= int(ts_sorted[k].item()):
+                idx = sort_idx[k]
+                break
+        if idx is None:
+            idx = sort_idx[-1]
+
+        Ct_b = []
+        ct_b = []
+        for b in range(B):
+            q_des = joint_goals[b, idx]  # [n]
+
+            # Assemble block-diagonal C and linear term c
+            C = torch.zeros(n_state + n, n_state + n, device=device, dtype=dtype)
+            # q block
+            C[0:n, 0:n] = q_weight * Iq
+            # v block
+            C[n:2*n, n:2*n] = v_weight * Iv
+            # u block
+            C[2*n:, 2*n:] = u_weight * Iu
+
+            c = torch.zeros(n_state + n, device=device, dtype=dtype)
+            c[0:n] = -q_weight * q_des
+
+            Ct_b.append(C)
+            ct_b.append(c)
+
+        C_seq.append(torch.stack(Ct_b, dim=0))
+        c_seq.append(torch.stack(ct_b, dim=0))
+
+    C_seq = torch.stack(C_seq, dim=0)
+    c_seq = torch.stack(c_seq, dim=0)
+    return QuadCost(C_seq, c_seq)
+
+
 class PandaEETrackingMPCLayer(torch.nn.Module):
-    """Differentiable MPC layer for Panda EE tracking with batch support.
+    """Differentiable MPC layer for Panda joint-space tracking.
 
     - Bakes in `dynamics` and horizon `T` at init time.
-    - Accepts per-batch goal positions/rotations and scalar weights at runtime.
-    - Maintains an absolute goal schedule (timesteps) internally and advances
-      it per forward call to build a time-varying cost.
-    - Builds a quadratic cost via `EETrackingCostFn` and solves MPC.
+    - Accepts per-batch joint goals and scalar weights at runtime.
+    - Maintains an absolute goal schedule (timesteps) and builds
+      a time-varying quadratic joint-space cost.
 
     Forward inputs
-      x_init: [B, n_state] current state (q concatenated with dq)
-      goal_positions: [B, K, 3]
-      goal_quaternions: [B, K, 4] (xyzw)
-      pos_weight, orient_weight, v_weight, u_weight: scalar tensors
+      x_init: [B, n_state]
+      joint_goals: [B, K, n]
+      q_weight, v_weight, u_weight: scalar tensors
 
     Returns
       x_traj: [T, B, n_state]
@@ -566,18 +648,15 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
     def forward(
         self,
         x_init: torch.Tensor,
-        goal_positions: torch.Tensor,
-        goal_quaternions: torch.Tensor,
-        pos_weight: torch.Tensor,
-        orient_weight: torch.Tensor,
+        joint_goals: torch.Tensor,
+        q_weight: torch.Tensor,
         v_weight: torch.Tensor,
         u_weight: torch.Tensor,
     ):
         assert x_init.ndimension() == 2 and x_init.size(1) == self.n_state
         B = x_init.size(0)
         # Require scalar weights for simplicity
-        assert pos_weight.ndimension() == 0
-        assert orient_weight.ndimension() == 0
+        assert q_weight.ndimension() == 0
         assert v_weight.ndimension() == 0
         assert u_weight.ndimension() == 0
 
@@ -585,15 +664,13 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
         # current internal rollout step.
         rel_ts = (self.goal_timesteps_abs - self.rollout_step).to(device=x_init.device)
 
-        cost = build_ee_tracking_cost_batched_timevarying(
+        cost = build_joint_tracking_cost_batched_timevarying(
             x_batch=x_init,
             T=self.T,
             goal_timesteps=rel_ts,
-            goal_positions=goal_positions,
-            goal_quaternions=goal_quaternions,
+            joint_goals=joint_goals,
             dynamics=self.dynamics,
-            pos_weight=pos_weight,
-            orient_weight=orient_weight,
+            q_weight=q_weight,
             v_weight=v_weight,
             u_weight=u_weight,
         )

@@ -8,8 +8,6 @@ import time
 import numpy as np
 import os
 import pinocchio as pin
-import pinocchio.rpy as rpy
-from scipy.spatial.transform import Rotation as R
 
 
 # Import MPC components and Panda dynamics from local mpc.py
@@ -85,28 +83,18 @@ def main():
     # Per-joint effort limits from Pinocchio dynamics
     effort_limits = layer.dynamics.effort_limit.detach().cpu().numpy().tolist()
 
-    # Define two goals to move from point A to point B (batched K=2).
-    goal_positions = torch.tensor(
-        [
-            [0.4,  0.2, 0.5],   # Goal A
-            [0.55, -0.2, 0.8], # Goal B
-        ], dtype=torch.get_default_dtype(), device=device
-    )
-    ee_goal_rpy = torch.tensor([3.14, 0.0, 0.0])
-    ee_goal_rpy_2 = torch.tensor([1.87, 0.0, 0.0])
-    rot = R.from_euler('xyz', ee_goal_rpy.tolist())
-    rot2 = R.from_euler('xyz', ee_goal_rpy_2.tolist())
-    # SciPy returns quaternions as [x, y, z, w]
-    quat = torch.tensor(rot.as_quat(), dtype=torch.get_default_dtype(), device=device)
-    quat2 = torch.tensor(rot2.as_quat(), dtype=torch.get_default_dtype(), device=device)
-    goal_quaternions = torch.stack([quat, quat2], dim=0)  # [K,4] (xyzw)
+    # Define two joint-space goals (batched K=2), relative to initial pose.
+    q_goal_A = initial_q.clone()
+    q_goal_A[:7] = q_goal_A[:7] + torch.tensor([0.20, -0.10, 0.00, 0.15, 0.00, -0.20, 0.15], dtype=q_goal_A.dtype, device=device)
+    q_goal_B = initial_q.clone()
+    q_goal_B[:7] = q_goal_B[:7] + 2 * torch.tensor([-0.30, 0.20, 0.10, -0.20, 0.00, 0.30, -0.15], dtype=q_goal_B.dtype, device=device)
+    joint_goals = torch.stack([q_goal_A, q_goal_B], dim=0)  # [K, n]
 
 
     # Weights for cost terms
     v_weight = torch.tensor(1e-2, dtype=torch.get_default_dtype(), device=device)
     u_weight = torch.tensor(1e-9, dtype=torch.get_default_dtype(), device=device)
-    pos_weight = torch.tensor(4.0, dtype=torch.get_default_dtype(), device=device)
-    orient_weight = torch.tensor(2.0, dtype=torch.get_default_dtype(), device=device)
+    q_weight = torch.tensor(4.0, dtype=torch.get_default_dtype(), device=device)
 
     # Initial state (current robot state)
     current_q = initial_q.clone().detach()
@@ -120,16 +108,13 @@ def main():
         s = time.monotonic()
 
         # Prepare batched goals for the layer: [B=1, K, ...]
-        gp_BK3 = goal_positions.unsqueeze(0)
-        gq_BK4 = goal_quaternions.unsqueeze(0)
+        jg_BKn = joint_goals.unsqueeze(0)
 
         # Solve MPC via differentiable layer
         x_mpc, u_mpc, obj = layer(
             x_init,
-            gp_BK3,
-            gq_BK4,
-            pos_weight,
-            orient_weight,
+            jg_BKn,
+            q_weight,
             v_weight,
             u_weight,
         )
