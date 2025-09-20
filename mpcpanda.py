@@ -604,7 +604,6 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
         self,
         urdf_path: str,
         T: int,
-        goal_timesteps_abs: torch.Tensor,
         dt: float = 0.01,
         device=None,
         with_gravity: bool = True,
@@ -622,8 +621,8 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
         self.n_ctrl = self.dynamics.nv
 
         # Absolute goal schedule and internal rollout step counter
-        assert isinstance(goal_timesteps_abs, torch.Tensor) and goal_timesteps_abs.ndimension() == 1
-        self.register_buffer('goal_timesteps_abs', goal_timesteps_abs.clone().long())
+        # assert isinstance(goal_timesteps_abs, torch.Tensor) and goal_timesteps_abs.ndimension() == 1
+        # self.register_buffer('goal_timesteps_abs', goal_timesteps_abs.clone().long())
         self.register_buffer('rollout_step', torch.zeros((), dtype=torch.long))
 
         # effort_max = self.dynamics.effort_limit.abs().unsqueeze(0).unsqueeze(0).repeat(T, 1, 1).to(dtype=torch.float)
@@ -649,6 +648,7 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
         self,
         x_init: torch.Tensor,
         joint_goals: torch.Tensor,
+        goal_timesteps: torch.Tensor,
         q_weight: torch.Tensor,
         v_weight: torch.Tensor,
         u_weight: torch.Tensor,
@@ -662,12 +662,12 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
 
         # Compute horizon-relative timesteps from absolute schedule and
         # current internal rollout step.
-        rel_ts = (self.goal_timesteps_abs - self.rollout_step).to(device=x_init.device)
+        # rel_ts = (self.goal_timesteps_abs - self.rollout_step).to(device=x_init.device)
 
         cost = build_joint_tracking_cost_batched_timevarying(
             x_batch=x_init,
             T=self.T,
-            goal_timesteps=rel_ts,
+            goal_timesteps=goal_timesteps,
             joint_goals=joint_goals,
             dynamics=self.dynamics,
             q_weight=q_weight,
