@@ -608,7 +608,7 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
         device=None,
         with_gravity: bool = True,
         lqr_iter: int = 1,
-        eps: float = 1e-3,
+        eps: float = 1e-2,
         verbose: int = 0,
     ):
         super().__init__()
@@ -635,13 +635,13 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
             T=self.T,
             u_lower=effort_min,
             u_upper=effort_max,
-            lqr_iter=lqr_iter, #lqr_iter,
+            lqr_iter=2, #lqr_iter,
             grad_method=GradMethods.ANALYTIC,
             verbose=verbose,
             eps=eps,
             n_batch=None,  # infer from cost
             exit_unconverged=False,
-            detach_unconverged=False,
+            detach_unconverged=True,
         )
 
         self.prev_u = None
