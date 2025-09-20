@@ -6,7 +6,7 @@ import pinocchio as pin
 
 # Add paths
 sys.path.insert(0, 'mpc.pytorch')
-from mpc.mpc import MPC, QuadCost, GradMethods
+from mpc.mpc import MPC, QuadCost, GradMethods, LinDx
 
 class PinocchioPandaDynamics(torch.nn.Module):
     """Pinocchio-based dynamics for fixed-base Panda with analytic Jacobians.
@@ -644,6 +644,8 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
             detach_unconverged=False,
         )
 
+        self.prev_u = None
+
     def forward(
         self,
         x_init: torch.Tensor,
@@ -675,12 +677,50 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
             u_weight=u_weight,
         )
 
-        x_traj, u_traj, costs = self.mpc(x_init, cost, self.dynamics)
+        lin_dx = self._build_linear_dynamics(x_init, B)
+
+        x_traj, u_traj, costs = self.mpc(x_init, cost, lin_dx)
         # Advance internal rollout step
         self.rollout_step += 1
+        with torch.no_grad():
+            shifted_u = torch.cat([u_traj[1:], u_traj[-1:]], dim=0)
+            self.prev_u = shifted_u.detach()
         # Detach costs to avoid backprop through extra LQRStep outputs
         return x_traj, u_traj, costs.detach()
 
     def reset_schedule(self, step: int = 0):
         """Reset internal rollout step (e.g., at episode start)."""
         self.rollout_step = torch.tensor(int(step), dtype=torch.long, device=self.rollout_step.device)
+        self.prev_u = None
+
+    def _build_linear_dynamics(self, x_init: torch.Tensor, batch_size: int) -> LinDx:
+        device = x_init.device
+        dtype = x_init.dtype
+
+        with torch.no_grad():
+            if self.prev_u is not None and self.prev_u.size(1) == batch_size:
+                nominal_u = self.prev_u.to(device=device, dtype=dtype)
+            else:
+                nominal_u = torch.zeros(self.T, batch_size, self.n_ctrl, device=device, dtype=dtype)
+
+            x_nominal = [x_init.detach()]
+            for t in range(self.T - 1):
+                x_next = self.dynamics(x_nominal[-1], nominal_u[t])
+                x_nominal.append(x_next)
+            x_nominal = torch.stack(x_nominal, dim=0)
+
+            F_list = []
+            f_list = []
+            for t in range(self.T - 1):
+                R, S = self.dynamics.grad_input(x_nominal[t], nominal_u[t])
+                F_t = torch.cat([R, S], dim=2)
+                x_pred = torch.bmm(R, x_nominal[t].unsqueeze(2)).squeeze(2)
+                u_pred = torch.bmm(S, nominal_u[t].unsqueeze(2)).squeeze(2)
+                f_t = x_nominal[t + 1] - x_pred - u_pred
+                F_list.append(F_t)
+                f_list.append(f_t)
+
+            F = torch.stack(F_list, dim=0)
+            f = torch.stack(f_list, dim=0)
+
+        return LinDx(F, f)

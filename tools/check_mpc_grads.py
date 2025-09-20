@@ -25,11 +25,9 @@ def main():
     dt = 0.01
     # MPC layer
     T = 10
-    goal_ts_abs = torch.tensor([3, 9], dtype=torch.long, device=device)
     layer = PandaEETrackingMPCLayer(
         urdf_path=urdf_path,
         T=T,
-        goal_timesteps_abs=goal_ts_abs,
         dt=dt,
         device=device,
         with_gravity=True,
@@ -59,6 +57,7 @@ def main():
     v_w = torch.tensor(1e-2, device=device, dtype=torch.float64, requires_grad=True)
     u_w = torch.tensor(1e-9, device=device, dtype=torch.float64, requires_grad=True)
 
+    goal_ts_abs = torch.tensor([3, 9], dtype=torch.long, device=device)
     # Forward solve wrapper to keep graph
     def forward_and_loss():
         # Ensure consistent goal schedule across evaluations (avoid internal step drift)
@@ -66,6 +65,7 @@ def main():
         x_mpc, u_mpc, _ = layer(
             x_init,
             joint_goals.unsqueeze(0),  # [1, K, n]
+            goal_ts_abs,
             q_w,
             v_w,
             u_w,

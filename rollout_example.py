@@ -44,11 +44,9 @@ def main():
     base_initial_q7 = [0.0, -0.8, 0.0, -np.pi / 2, 0.0, 0.5, np.pi / 4]
     
     # Instantiate differentiable MPC layer (internally builds dynamics)
-    goal_timesteps_abs = torch.tensor([60, 120], dtype=torch.long, device=device)
     layer = PandaEETrackingMPCLayer(
         urdf_path=urdf_path,
         T=10,
-        goal_timesteps_abs=goal_timesteps_abs,
         dt=solve_timestep,
         device=device,
         with_gravity=True,
@@ -56,6 +54,8 @@ def main():
         eps=1e-3,
         verbose=0,
     ).to(device)
+
+    goal_timesteps = torch.tensor([60, 120], dtype=torch.long, device=device)
 
     n = layer.n_ctrl  # number of actuated DoF
 
@@ -114,6 +114,7 @@ def main():
         x_mpc, u_mpc, obj = layer(
             x_init,
             jg_BKn,
+            goal_timesteps,
             q_weight,
             v_weight,
             u_weight,
