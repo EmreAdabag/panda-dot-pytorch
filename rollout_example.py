@@ -21,10 +21,10 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     device = 'cpu'
     print(f'using device: {device}')
-    control_mode = 'torque'
+    control_mode = 'position'
 
     sim_timestep = 0.005
-    solve_timestep = 0.01
+    solve_timestep = 0.05
 
     # Initialize PyBullet (DIRECT by default; set PYBULLET_GUI=1 for GUI)
     # use_gui = os.environ.get("PYBULLET_GUI", "0") == "1"
@@ -46,7 +46,7 @@ def main():
     # Instantiate differentiable MPC layer (internally builds dynamics)
     layer = PandaEETrackingMPCLayer(
         urdf_path=urdf_path,
-        T=10,
+        T=20,
         dt=solve_timestep,
         device=device,
         with_gravity=True,
@@ -85,10 +85,10 @@ def main():
 
     # Define two joint-space goals (batched K=2), relative to initial pose.
     q_goal_A = initial_q.clone()
-    q_goal_A[:7] = q_goal_A[:7] + torch.tensor([0.20, -0.10, 0.00, 0.15, 0.00, -0.20, 0.15], dtype=q_goal_A.dtype, device=device)
+    q_goal_A[:7] = q_goal_A[:7] + torch.tensor([0.30, -0.10, 0.00, 0.35, 0.50, -0.20, 0.15], dtype=q_goal_A.dtype, device=device)
     q_goal_B = initial_q.clone()
     q_goal_B[:7] = q_goal_B[:7] + 2 * torch.tensor([-0.30, 0.20, 0.10, -0.20, 0.00, 0.30, -0.15], dtype=q_goal_B.dtype, device=device)
-    joint_goals = torch.stack([q_goal_A, q_goal_B], dim=0)  # [K, n]
+    joint_goals = torch.stack([q_goal_B, q_goal_A], dim=0)  # [K, n]
 
 
     # Weights for cost terms
@@ -114,7 +114,7 @@ def main():
         x_mpc, u_mpc, obj = layer(
             x_init,
             jg_BKn,
-            goal_timesteps,
+            goal_timesteps - step,
             q_weight,
             v_weight,
             u_weight,
@@ -131,13 +131,13 @@ def main():
                     force=float(u_cmd[i])
                 )
         else:
-            x_cmd = x_mpc[4,0].detach().cpu().numpy()
+            x_cmd = x_mpc[0, 4].detach().cpu().numpy()
             for i in range(n):
                 p.setJointMotorControl2(
                     bodyUniqueId=robot_id,
                     jointIndex=i,
                     controlMode=p.POSITION_CONTROL,
-                    targetPosition=float(x_cmd[i].item()),
+                    targetPosition=float(x_cmd[i]),
                     positionGain=0.05,
                     velocityGain=1.0,
                     force=float(effort_limits[i])

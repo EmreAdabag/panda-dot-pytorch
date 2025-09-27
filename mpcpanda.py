@@ -635,7 +635,7 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
             T=self.T,
             u_lower=effort_min,
             u_upper=effort_max,
-            lqr_iter=2, #lqr_iter,
+            lqr_iter=lqr_iter,
             grad_method=GradMethods.ANALYTIC,
             verbose=verbose,
             eps=eps,
@@ -677,37 +677,82 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
             u_weight=u_weight,
         )
 
-        lin_dx = self._build_linear_dynamics(x_init, B)
+        lin_dx = self._build_linear_dynamics(x_init, joint_goals, goal_timesteps, B)
 
         x_traj, u_traj, costs = self.mpc(x_init, cost, lin_dx)
         # Advance internal rollout step
-        self.rollout_step += 1
-        with torch.no_grad():
-            shifted_u = torch.cat([u_traj[1:], u_traj[-1:]], dim=0)
-            self.prev_u = shifted_u.detach()
         # Detach costs to avoid backprop through extra LQRStep outputs
-        return x_traj, u_traj, costs.detach()
+        return x_traj.transpose(0, 1), u_traj.transpose(0, 1), costs.detach()
 
     def reset_schedule(self, step: int = 0):
         """Reset internal rollout step (e.g., at episode start)."""
         self.rollout_step = torch.tensor(int(step), dtype=torch.long, device=self.rollout_step.device)
         self.prev_u = None
 
-    def _build_linear_dynamics(self, x_init: torch.Tensor, batch_size: int) -> LinDx:
+    def _build_linear_dynamics(
+        self,
+        x_init: torch.Tensor,
+        joint_goals: torch.Tensor,
+        goal_timesteps: torch.Tensor,
+        batch_size: int,
+    ) -> LinDx:
         device = x_init.device
         dtype = x_init.dtype
 
         with torch.no_grad():
-            if self.prev_u is not None and self.prev_u.size(1) == batch_size:
-                nominal_u = self.prev_u.to(device=device, dtype=dtype)
-            else:
-                nominal_u = torch.zeros(self.T, batch_size, self.n_ctrl, device=device, dtype=dtype)
+            nominal_u = torch.zeros(self.T, batch_size, self.n_ctrl, device=device, dtype=dtype)
 
-            x_nominal = [x_init.detach()]
-            for t in range(self.T - 1):
-                x_next = self.dynamics(x_nominal[-1], nominal_u[t])
-                x_nominal.append(x_next)
-            x_nominal = torch.stack(x_nominal, dim=0)
+            n = self.n_ctrl
+            q0 = x_init[:, :n]
+            v0 = x_init[:, n:]
+
+            q_nominal = torch.zeros(self.T, batch_size, n, device=device, dtype=dtype)
+            v_nominal = torch.zeros_like(q_nominal)
+
+            q_nominal[0] = q0
+            v_nominal[0] = v0
+
+            goal_ts_list = []
+            if goal_timesteps.numel() > 0:
+                goal_ts_list = [max(0, min(self.T - 1, int(ts))) for ts in goal_timesteps.tolist()]
+
+            goal_count = min(len(goal_ts_list), joint_goals.size(1))
+
+            if goal_count == 0:
+                for t in range(1, self.T):
+                    q_nominal[t] = q0
+            else:
+                goal_targets = joint_goals[:, :goal_count, :]
+
+                prev_time = 0
+                prev_q = q0
+                next_idx = 0
+                next_time = goal_ts_list[next_idx]
+                next_q = goal_targets[:, next_idx, :]
+
+                for t in range(1, self.T):
+                    while next_idx < goal_count and t > next_time:
+                        prev_time = next_time
+                        prev_q = next_q
+                        next_idx += 1
+                        if next_idx < goal_count:
+                            next_time = goal_ts_list[next_idx]
+                            next_q = goal_targets[:, next_idx, :]
+
+                    if next_idx >= goal_count:
+                        q_nominal[t] = prev_q
+                        continue
+
+                    denom = max(next_time - prev_time, 1)
+                    alpha = (t - prev_time) / float(denom)
+                    alpha = min(max(alpha, 0.0), 1.0)
+                    q_nominal[t] = (1.0 - alpha) * prev_q + alpha * next_q
+
+            dt = float(self.dynamics.dt)
+            for t in range(1, self.T):
+                v_nominal[t] = (q_nominal[t] - q_nominal[t - 1]) / dt
+
+            x_nominal = torch.cat([q_nominal, v_nominal], dim=2)
 
             F_list = []
             f_list = []
