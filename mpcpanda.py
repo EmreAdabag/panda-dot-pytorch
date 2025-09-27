@@ -635,7 +635,7 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
             T=self.T,
             u_lower=effort_min,
             u_upper=effort_max,
-            lqr_iter=2, #lqr_iter,
+            lqr_iter=lqr_iter,
             grad_method=GradMethods.ANALYTIC,
             verbose=verbose,
             eps=eps,
@@ -679,10 +679,10 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
 
         lin_dx = self._build_linear_dynamics(x_init, joint_goals, goal_timesteps, B)
 
-        x_traj, u_traj, costs, converged_mask = self.mpc(x_init, cost, lin_dx)
+        x_traj, u_traj, costs = self.mpc(x_init, cost, lin_dx)
         # Advance internal rollout step
         # Detach costs to avoid backprop through extra LQRStep outputs
-        return x_traj.transpose(0, 1), u_traj.transpose(0, 1), costs.detach(), converged_mask.detach()
+        return x_traj.transpose(0, 1), u_traj.transpose(0, 1), costs.detach()
 
     def reset_schedule(self, step: int = 0):
         """Reset internal rollout step (e.g., at episode start)."""
