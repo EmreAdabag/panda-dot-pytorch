@@ -55,8 +55,6 @@ def main():
         verbose=0,
     ).to(device)
 
-    goal_timesteps = torch.tensor([60, 120], dtype=torch.long, device=device)
-
     n = layer.n_ctrl  # number of actuated DoF
 
     # Build initial_q of length n
@@ -83,12 +81,10 @@ def main():
     # Per-joint effort limits from Pinocchio dynamics
     effort_limits = layer.dynamics.effort_limit.detach().cpu().numpy().tolist()
 
-    # Define two joint-space goals (batched K=2), relative to initial pose.
-    q_goal_A = initial_q.clone()
-    q_goal_A[:7] = q_goal_A[:7] + torch.tensor([0.30, -0.10, 0.00, 0.35, 0.50, -0.20, 0.15], dtype=q_goal_A.dtype, device=device)
-    q_goal_B = initial_q.clone()
-    q_goal_B[:7] = q_goal_B[:7] + 2 * torch.tensor([-0.30, 0.20, 0.10, -0.20, 0.00, 0.30, -0.15], dtype=q_goal_B.dtype, device=device)
-    joint_goals = torch.stack([q_goal_B, q_goal_A], dim=0)  # [K, n]
+    # Sine wave parameters for cyclic motion
+    sine_amplitudes = torch.tensor([0.3, 0.0, 0.0, 0.4, 0.0, 0.0, 0.0], dtype=torch.get_default_dtype(), device=device)
+    sine_frequencies = torch.tensor([0.3, 0.0, 0.0, 0.6, 0.0, 0.0, 0.0], dtype=torch.get_default_dtype(), device=device)  # Hz
+    sine_offsets = torch.tensor([0.0, 0.0, 0.0, -0.2, 0.0, 0.0, 0.0], dtype=torch.get_default_dtype(), device=device) 
 
 
     # Weights for cost terms
@@ -107,14 +103,23 @@ def main():
     for step in range(max_steps):
         s = time.monotonic()
 
-        # Prepare batched goals for the layer: [B=1, K, ...]
-        jg_BKn = joint_goals.unsqueeze(0)
+        # Generate sine wave targets for current time
+        current_time = step * solve_timestep
+        q_target = initial_q.clone()
+        for i in range(min(7, n)):
+            if sine_frequencies[i] > 0:  # Only apply sine wave if frequency > 0
+                q_target[i] = initial_q[i] + sine_amplitudes[i] * torch.sin(2 * np.pi * sine_frequencies[i] * current_time) + sine_offsets[i]
+        
+        # Create single goal (K=1) for sine wave tracking
+        joint_goals = q_target.unsqueeze(0)  # [K=1, n]
+        jg_BKn = joint_goals.unsqueeze(0)  # [B=1, K=1, n]
+        goal_timesteps = torch.tensor([10], dtype=torch.long, device=device)  # Fixed horizon
 
         # Solve MPC via differentiable layer
         x_mpc, u_mpc, obj = layer(
             x_init,
             jg_BKn,
-            goal_timesteps - step,
+            goal_timesteps,
             q_weight,
             v_weight,
             u_weight,
