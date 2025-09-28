@@ -50,8 +50,8 @@ def main():
         dt=solve_timestep,
         device=device,
         with_gravity=True,
-        lqr_iter=1,
-        eps=1e-3,
+        lqr_iter=2,
+        eps=1e-1,
         verbose=0,
     ).to(device)
 

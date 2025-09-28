@@ -636,12 +636,12 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
             u_lower=effort_min,
             u_upper=effort_max,
             lqr_iter=lqr_iter,
-            grad_method=GradMethods.ANALYTIC,
+            grad_method=GradMethods.AUTO_DIFF,
             verbose=verbose,
             eps=eps,
             n_batch=None,  # infer from cost
             exit_unconverged=False,
-            detach_unconverged=True,
+            detach_unconverged=False,
         )
 
         self.prev_u = None
