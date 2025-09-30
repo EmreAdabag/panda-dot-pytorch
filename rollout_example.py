@@ -34,7 +34,7 @@ def main():
     p.setTimeStep(sim_timestep)
     
     # Load Panda URDF
-    urdf_path = "/home/emrea/panda_pytorch/robot_description/panda_with_gripper.urdf"
+    urdf_path = "/home/emrea/code/panda.pytorch/robot_description/panda_with_actuated_gripper.urdf"
     robot_id = p.loadURDF(urdf_path, [0, 0, 0], useFixedBase=True, flags=p.URDF_USE_INERTIA_FROM_FILE)  # Fix base at ground level
     
     # Add ground plane
@@ -56,6 +56,7 @@ def main():
     ).to(device)
 
     n = layer.n_ctrl  # number of actuated DoF
+    print(f"Number of actuated DOFs: {n}")
 
     # Build initial_q of length n
     initial_q = torch.zeros(n, device=device)
@@ -81,11 +82,14 @@ def main():
     # Per-joint effort limits from Pinocchio dynamics
     effort_limits = layer.dynamics.effort_limit.detach().cpu().numpy().tolist()
 
-    # Sine wave parameters for cyclic motion
-    sine_amplitudes = torch.tensor([0.3, 0.0, 0.0, 0.4, 0.0, 0.0, 0.0], dtype=torch.get_default_dtype(), device=device)
-    sine_frequencies = torch.tensor([0.3, 0.0, 0.0, 0.6, 0.0, 0.0, 0.0], dtype=torch.get_default_dtype(), device=device)  # Hz
-    sine_offsets = torch.tensor([0.0, 0.0, 0.0, -0.2, 0.0, 0.0, 0.0], dtype=torch.get_default_dtype(), device=device) 
-
+    # Sine wave parameters for cyclic motion (extended for gripper)
+    sine_amplitudes = [0.3, 0.0, 0.0, 0.4, 0.0, 0.0, 0.0, 0.03] + [0.0] * (n-8)
+    sine_frequencies = [0.3, 0.0, 0.0, 0.6, 0.0, 0.0, 0.0, 0.4] + [0.0] * (n-8)  # Hz
+    sine_offsets = [0.0, 0.0, 0.0, -0.2, 0.0, 0.0, 0.0, 0.02] + [0.0] * (n-8)
+    
+    sine_amplitudes = torch.tensor(sine_amplitudes[:n], dtype=torch.get_default_dtype(), device=device)
+    sine_frequencies = torch.tensor(sine_frequencies[:n], dtype=torch.get_default_dtype(), device=device)
+    sine_offsets = torch.tensor(sine_offsets[:n], dtype=torch.get_default_dtype(), device=device)
 
     # Weights for cost terms
     v_weight = torch.tensor(1e-2, dtype=torch.get_default_dtype(), device=device)
@@ -106,7 +110,7 @@ def main():
         # Generate sine wave targets for current time
         current_time = step * solve_timestep
         q_target = initial_q.clone()
-        for i in range(min(7, n)):
+        for i in range(min(len(sine_frequencies), n)):
             if sine_frequencies[i] > 0:  # Only apply sine wave if frequency > 0
                 q_target[i] = initial_q[i] + sine_amplitudes[i] * torch.sin(2 * np.pi * sine_frequencies[i] * current_time) + sine_offsets[i]
         
@@ -129,23 +133,16 @@ def main():
         if control_mode == "torque":
             u_cmd = u_mpc[0, 0].detach().cpu().numpy()
             for i in range(n):
-                p.setJointMotorControl2(
-                    robot_id,
-                    i,
-                    controlMode=p.TORQUE_CONTROL,
-                    force=float(u_cmd[i])
-                )
+                joint_idx = i if i < 7 else (8 if i == 7 else 9)  # Map gripper joints
+                p.setJointMotorControl2(robot_id, joint_idx, p.TORQUE_CONTROL, force=float(u_cmd[min(i, 7)]))
         else:
             x_cmd = x_mpc[0, 4].detach().cpu().numpy()
             for i in range(n):
+                joint_idx = i if i < 7 else (8 if i == 7 else 9)  # Map gripper joints
                 p.setJointMotorControl2(
-                    bodyUniqueId=robot_id,
-                    jointIndex=i,
-                    controlMode=p.POSITION_CONTROL,
-                    targetPosition=float(x_cmd[i]),
-                    positionGain=0.05,
-                    velocityGain=1.0,
-                    force=float(effort_limits[i])
+                    robot_id, joint_idx, p.POSITION_CONTROL,
+                    targetPosition=float(x_cmd[min(i, 7)]),  # Both gripper joints use same command
+                    positionGain=0.05, velocityGain=1.0, force=float(effort_limits[min(i, 7)])
                 )
         
         # Step simulation
@@ -156,8 +153,9 @@ def main():
         
         # Get new state
         for i in range(n):
-            current_q[i] = p.getJointState(robot_id, i)[0]
-            current_qdot[i] = p.getJointState(robot_id, i)[1]
+            joint_idx = i if i < 7 else (8 if i == 7 else 8)  # Both gripper DOFs read from joint 8
+            current_q[i] = p.getJointState(robot_id, joint_idx)[0]
+            current_qdot[i] = p.getJointState(robot_id, joint_idx)[1]
         
         x_init = torch.cat([current_q, current_qdot]).unsqueeze(0)
         
