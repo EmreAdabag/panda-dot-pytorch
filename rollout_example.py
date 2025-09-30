@@ -2,19 +2,11 @@ import torch
 import numpy as np
 import pybullet as p
 import pybullet_data
-import sys
 import os
 import time
-import numpy as np
-import os
-import pinocchio as pin
 
 
-# Import MPC components and Panda dynamics from local mpc.py
-from mpcpanda import (
-    PandaEETrackingMPCLayer,
-    GradMethods,
-)
+from mpcpanda import PandaMPCLayer
 
 
 def main():
@@ -44,7 +36,7 @@ def main():
     base_initial_q7 = [0.0, -0.8, 0.0, -np.pi / 2, 0.0, 0.5, np.pi / 4]
     
     # Instantiate differentiable MPC layer (internally builds dynamics)
-    layer = PandaEETrackingMPCLayer(
+    layer = PandaMPCLayer(
         urdf_path=urdf_path,
         T=20,
         dt=solve_timestep,
@@ -87,17 +79,14 @@ def main():
     sine_offsets = torch.tensor([0.0, 0.0, 0.0, -0.2, 0.0, 0.0, 0.0], dtype=torch.get_default_dtype(), device=device) 
 
 
-    # Weights for cost terms
-    v_weight = torch.tensor(1e-2, dtype=torch.get_default_dtype(), device=device)
+    # Control weight
     u_weight = torch.tensor(1e-9, dtype=torch.get_default_dtype(), device=device)
-    q_weight = torch.tensor(4.0, dtype=torch.get_default_dtype(), device=device)
 
     # Initial state (current robot state)
     current_q = initial_q.clone().detach()
     current_qdot = torch.zeros(n, device=device)
     x_init = torch.cat([current_q, current_qdot]).unsqueeze(0)  # [B=1, n_state]
     
-    # time this mpc solve
     # MPC control loop
     max_steps = int(os.environ.get("MPC_STEPS", "2000"))
     for step in range(max_steps):
@@ -110,18 +99,26 @@ def main():
             if sine_frequencies[i] > 0:  # Only apply sine wave if frequency > 0
                 q_target[i] = initial_q[i] + sine_amplitudes[i] * torch.sin(2 * np.pi * sine_frequencies[i] * current_time) + sine_offsets[i]
         
-        # Create single goal (K=1) for sine wave tracking
-        joint_goals = q_target.unsqueeze(0)  # [K=1, n]
-        jg_BKn = joint_goals.unsqueeze(0)  # [B=1, K=1, n]
-        goal_timesteps = torch.tensor([10], dtype=torch.long, device=device)  # Fixed horizon
+        # Create diagonal cost weights and linear terms
+        n_state = layer.n_state
+        T = layer.T
+        
+        # Diagonal C weights in log space: higher weight on position tracking, lower on velocity
+        diag_C_log = torch.zeros(T, n_state, device=device)
+        diag_C_log[:, :n] = torch.log(torch.tensor(4.0))  # log(position weights)
+        diag_C_log[:, n:] = torch.log(torch.tensor(1e-2))  # log(velocity weights)
+        diag_C_flat = diag_C_log.flatten()
+        
+        # Linear c terms: track sine wave target
+        c_vec = torch.zeros(T, n_state, device=device)
+        c_vec[:, :n] = -4.0 * q_target  # negative because cost is 0.5*x^T*C*x + c^T*x
+        c_flat = c_vec.flatten()
 
         # Solve MPC via differentiable layer
         x_mpc, u_mpc, obj = layer(
             x_init,
-            jg_BKn,
-            goal_timesteps,
-            q_weight,
-            v_weight,
+            diag_C_flat,
+            c_flat,
             u_weight,
         )
 

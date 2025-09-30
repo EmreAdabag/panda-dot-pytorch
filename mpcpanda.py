@@ -1,10 +1,8 @@
 import torch
 import numpy as np
 import sys
-import numpy as np
 import pinocchio as pin
 
-# Add paths
 sys.path.insert(0, 'mpc.pytorch')
 from mpc.mpc import MPC, QuadCost, GradMethods, LinDx
 
@@ -61,15 +59,18 @@ class PinocchioPandaDynamics(torch.nn.Module):
         return q_next, v_next
 
     def forward(self, x, u):
-        # x: [B, 2*n], u: [B, n]
+        assert x.ndimension() == 2
+        assert u.ndimension() == 2
         B = x.shape[0]
+        assert u.shape[0] == B
         dev = x.device
         dtype = x.dtype
 
         n = self.nv
+        assert x.shape[1] == 2 * n
+        assert u.shape[1] == n
         q = x[:, :n]
         v = x[:, n:]
-        # No clamping for minimal implementation
 
         q_next_list = []
         v_next_list = []
@@ -87,17 +88,20 @@ class PinocchioPandaDynamics(torch.nn.Module):
 
     @torch.no_grad()
     def grad_input(self, x, u):
-        # Returns R, S with shapes [B,2n,2n] and [B,2n,n]
+        assert x.ndimension() == 2
+        assert u.ndimension() == 2
         B = x.shape[0]
+        assert u.shape[0] == B
         dev = x.device
         dtype = x.dtype
         dt = self.dt
 
         pin = self.pin
         n = self.nv
+        assert x.shape[1] == 2 * n
+        assert u.shape[1] == n
         In = torch.eye(n, device=dev, dtype=dtype).expand(B, n, n)
 
-        # Prepare outputs
         R = torch.zeros(B, 2*n, 2*n, device=dev, dtype=dtype)
         S = torch.zeros(B, 2*n, n, device=dev, dtype=dtype)
 
@@ -141,459 +145,80 @@ class PinocchioPandaDynamics(torch.nn.Module):
         return R, S
 
 
-def quat_xyzw_to_matrix(quat: torch.Tensor) -> torch.Tensor:
-    """Convert quaternion(s) in xyzw to rotation matrix/matrices.
-
-    Tries PyTorch3D's `quaternion_to_matrix` (expects wxyz), otherwise uses
-    a pure-Torch implementation. Accepts shape [..., 4], returns [..., 3, 3].
-    """
-    assert quat.shape[-1] == 4
-    # Fallback: pure Torch differentiable conversion
-    q = quat / (quat.norm(dim=-1, keepdim=True) + 1e-15)
-    x, y, z, w = q.unbind(-1)
-    two = torch.tensor(2.0, dtype=q.dtype, device=q.device)
-    xx = x * x; yy = y * y; zz = z * z
-    xy = x * y; xz = x * z; yz = y * z
-    xw = x * w; yw = y * w; zw = z * w
-
-    m00 = 1 - two * (yy + zz)
-    m01 = two * (xy - zw)
-    m02 = two * (xz + yw)
-    m10 = two * (xy + zw)
-    m11 = 1 - two * (xx + zz)
-    m12 = two * (yz - xw)
-    m20 = two * (xz - yw)
-    m21 = two * (yz + xw)
-    m22 = 1 - two * (xx + yy)
-
-    M = torch.stack([
-        torch.stack([m00, m01, m02], dim=-1),
-        torch.stack([m10, m11, m12], dim=-1),
-        torch.stack([m20, m21, m22], dim=-1),
-    ], dim=-2)
-    return M
 
 
-class EETrackingCostFn(torch.autograd.Function):
-    """Custom autograd for assembling quadratic cost C, c.
 
-    Provides gradients w.r.t. ee_goal_pos and weights. Gradients for q are
-    not provided (treated as constant here). Orientation gradient w.r.t.
-    ee_goal_R is not implemented analytically in this version.
-    """
-
-    @staticmethod
-    def forward(ctx, x_state, ee_goal_pos, ee_goal_R, pos_weight, orient_weight, v_weight, u_weight, dynamics, ee_frame_id, n_state, n_ctrl):
-        device = x_state.device
-        dtype = x_state.dtype
-
-        # Kinematics/Jacobians via Pinocchio at the given q
-        # Use only the configuration part for kinematics
-        assert x_state.ndimension() == 1 and x_state.numel() == n_state
-        q = x_state[:n_ctrl]
-        q_np = q.detach().cpu().numpy().astype(np.float64)
-        dynamics.pin.forwardKinematics(dynamics.model, dynamics.data, q_np)
-        pin.updateFramePlacements(dynamics.model, dynamics.data)
-        fk = dynamics.data.oMf[ee_frame_id]
-        p_cur = torch.from_numpy(np.asarray(fk.translation)).to(device=device, dtype=dtype)
-        R_cur = np.asarray(fk.rotation)
-
-        e_pos = p_cur - ee_goal_pos
-        R_err = ee_goal_R.detach().cpu().numpy() @ R_cur.T
-        e_rot_np = pin.log3(R_err)
-        e_rot = torch.from_numpy(np.asarray(e_rot_np)).to(device=device, dtype=dtype)
-
-        J6 = pin.computeFrameJacobian(
-            dynamics.model,
-            dynamics.data,
-            q_np,
-            ee_frame_id,
-            pin.ReferenceFrame.WORLD,
-        )
-        J_pos = torch.from_numpy(np.asarray(J6[:3, :])).to(device=device, dtype=dtype)
-        J_rot = torch.from_numpy(np.asarray(J6[3:6, :])).to(device=device, dtype=dtype)
-
-        # Quadratic terms
-        n = n_ctrl
-        Qq = pos_weight * (J_pos.T @ J_pos) + orient_weight * (J_rot.T @ J_rot)
-        pq = pos_weight * (J_pos.T @ e_pos) - orient_weight * (J_rot.T @ e_rot)
-        pq = pq - Qq @ q
-
-        C = torch.zeros(n_state + n_ctrl, n_state + n_ctrl, device=device, dtype=dtype)
-        C[0:n, 0:n] = Qq
-        C[n:2*n, n:2*n] = v_weight * torch.eye(n, device=device, dtype=dtype)
-        C[2*n:, 2*n:] = u_weight * torch.eye(n_ctrl, device=device, dtype=dtype)
-
-        c = torch.zeros(n_state + n_ctrl, device=device, dtype=dtype)
-        c[0:n] = pq
-
-        # Save for backward
-        ctx.save_for_backward(J_pos, J_rot, e_pos, e_rot, q, ee_goal_R,
-                               torch.tensor(n_state), torch.tensor(n_ctrl),
-                               pos_weight, orient_weight, v_weight, u_weight)
-        ctx.dynamics = dynamics
-        ctx.ee_frame_id = ee_frame_id
-        return C, c
-
-    @staticmethod
-    def backward(ctx, gC, gc):
-        J_pos, J_rot, e_pos, e_rot, q, R_des, n_state_t, n_ctrl_t, pos_w, ori_w, v_w, u_w = ctx.saved_tensors
-        n_ctrl = int(n_ctrl_t.item())
-
-        # Upstream grads slices
-        n = n_ctrl
-        gCqq = gC[0:n, 0:n]
-        gCvv = gC[n:2*n, n:2*n]
-        gCuu = gC[2*n:, 2*n:]
-        gc_q = gc[0:n]
-
-        # Gradients init
-        g_q = None  # no gradient for q
-
-        # ee_goal_pos gradient: d pq / d goal_pos = -pos_w * J_pos^T applied to gc_q
-        gee_pos = -(pos_w.item()) * (J_pos @ gc_q)
-
-        # ee_goal_R gradient via SO(3) log residual
-        # Upstream gradient on e_rot from c_q term: c_q includes (-ori_w * J_rot^T e_rot)
-        g_e = -(ori_w.item()) * (J_rot @ gc_q)  # shape (3,)
-
-        def hat(v):
-            vx, vy, vz = v[0], v[1], v[2]
-            H = torch.zeros(3, 3, dtype=v.dtype, device=v.device)
-            H[0,1] = -vz; H[0,2] =  vy
-            H[1,0] =  vz; H[1,2] = -vx
-            H[2,0] = -vy; H[2,1] =  vx
-            return H
-
-        def so3_right_jacobian_inv(phi):
-            I = torch.eye(3, dtype=phi.dtype, device=phi.device)
-            theta = torch.norm(phi)
-            eps = torch.tensor(1e-8, dtype=phi.dtype, device=phi.device)
-            H = hat(phi)
-            theta_clamped = torch.clamp(theta, min=eps)
-            # stable b term
-            half = -0.5
-            if theta.item() < 1e-5:
-                b = 1.0/12.0
-            else:
-                b = (1.0/(theta_clamped*theta_clamped) - (1.0+torch.cos(theta_clamped))/(2.0*theta_clamped*torch.sin(theta_clamped)))
-            return I + half*H + b*(H @ H)
-
-        Jr_inv = so3_right_jacobian_inv(e_rot)
-        # A = (Jr_inv)^T * g_e
-        A = Jr_inv.t() @ g_e
-        Gee_R = 0.5 * (R_des @ hat(R_des.t() @ A))
-
-        # pos_weight gradient
-        JpTJp = J_pos.T @ J_pos
-        termC_pos = (gCqq * JpTJp).sum()
-        termc_pos = gc_q @ (J_pos.T @ e_pos - JpTJp @ q)
-        g_pos_w = termC_pos + termc_pos
-
-        # orient_weight gradient
-        JrTJr = J_rot.T @ J_rot
-        termC_ori = (gCqq * JrTJr).sum()
-        termc_ori = gc_q @ (- J_rot.T @ e_rot - JrTJr @ q)
-        g_ori_w = termC_ori + termc_ori
-
-        # v_weight gradient: only on diagonal block
-        g_v_w = torch.trace(gCvv)
-
-        # u_weight gradient: only on diagonal block
-        g_u_w = torch.trace(gCuu)
-
-        # None for dynamics-related saved constants
-        return (
-            g_q,          # x_state
-            gee_pos,      # ee_goal_pos
-            Gee_R,          # ee_goal_R
-            g_pos_w,      # pos_weight
-            g_ori_w,      # orient_weight
-            g_v_w,        # v_weight
-            g_u_w,        # u_weight
-            None,         # dynamics
-            None,         # ee_frame_id
-            None,         # n_state
-            None,         # n_ctrl
-        )
-
-
-# def build_ee_tracking_cost_runtime(
-#     q: torch.Tensor,
-#     T: torch.Tensor,
-#     goal_timesteps: torch.Tensor,
-#     goal_positions: torch.Tensor,
-#     goal_rotations: torch.Tensor,
-#     dynamics: PinocchioPandaDynamics,
-#     pos_weight: torch.Tensor,
-#     orient_weight: torch.Tensor,
-#     v_weight: torch.Tensor,
-#     u_weight: torch.Tensor,
-# ):
-#     """Assemble a time-varying QuadCost for multiple goals provided at runtime.
-
-#     All inputs must be tensors. Fails with assertions if shapes/dtypes mismatch.
-
-#     Args (tensors):
-#       q: [n_ctrl]
-#       T: scalar long tensor (horizon)
-#       goal_timesteps: [K] long tensor; horizon-relative indices, can be > T-1
-#       goal_positions: [K, 3]
-#       goal_rotations: [K, 3, 3]
-#       pos_weight, orient_weight, v_weight, u_weight: scalar tensors
-#     """
-#     assert isinstance(q, torch.Tensor) and q.ndimension() == 1
-#     assert isinstance(T, torch.Tensor) and T.numel() == 1
-#     assert isinstance(goal_timesteps, torch.Tensor) and goal_timesteps.ndimension() == 1
-#     assert isinstance(goal_positions, torch.Tensor) and goal_positions.ndimension() == 2 and goal_positions.size(1) == 3
-#     assert isinstance(goal_rotations, torch.Tensor) and goal_rotations.ndimension() == 3 and goal_rotations.size(1) == 3 and goal_rotations.size(2) == 3
-#     assert goal_timesteps.size(0) == goal_positions.size(0) == goal_rotations.size(0)
-
-#     device = q.device
-#     dtype = q.dtype
-#     T_int = int(T.item())
-#     K = goal_timesteps.size(0)
-
-#     # Infer fixed parameters from dynamics
-#     ee_frame_id = dynamics.model.getFrameId("panda_hand")
-#     n_ctrl = dynamics.nv
-#     n_state = dynamics.nq + dynamics.nv
-
-#     # Prepare weights on correct device/dtype
-#     pw = pos_weight.to(device=device, dtype=dtype)
-#     ow = orient_weight.to(device=device, dtype=dtype)
-#     vw = v_weight.to(device=device, dtype=dtype)
-#     uw = u_weight.to(device=device, dtype=dtype)
-
-#     # Sort goals by timestep ascending
-#     sort_idx = torch.argsort(goal_timesteps)
-#     ts_sorted = goal_timesteps[sort_idx]
-#     gp_sorted = goal_positions[sort_idx].to(device=device, dtype=dtype)
-#     gr_sorted = goal_rotations[sort_idx].to(device=device, dtype=dtype)
-
-#     # Build sequences without in-place writes to preserve autograd graph
-#     n_tau = n_state + n_ctrl
-#     C_list = []
-#     c_list = []
-
-#     # Map each horizon timestep t to the "next goal" and build via EETrackingCostFn
-#     for t in range(T_int):
-#         idx = None
-#         for k in range(K):
-#             if t <= int(ts_sorted[k].item()):
-#                 idx = k
-#                 break
-#         if idx is None:
-#             idx = K - 1
-
-#         C_t, c_t = EETrackingCostFn.apply(
-#             q,
-#             gp_sorted[idx],
-#             gr_sorted[idx],
-#             pw,
-#             ow,
-#             vw,
-#             uw,
-#             dynamics,
-#             ee_frame_id,
-#             n_state,
-#             n_ctrl,
-#         )
-#         C_list.append(C_t)
-#         c_list.append(c_t)
-
-#     C_seq = torch.stack(C_list, dim=0)
-#     c_seq = torch.stack(c_list, dim=0)
-#     return QuadCost(C_seq, c_seq)
-
-
-def build_ee_tracking_cost_batched_timevarying(
+def build_diagonal_cost_vectorized(
     x_batch: torch.Tensor,
     T: int,
-    goal_timesteps: torch.Tensor,
-    goal_positions: torch.Tensor,
-    goal_quaternions: torch.Tensor,
+    diag_C_flat: torch.Tensor,
+    c_flat: torch.Tensor,
     dynamics: PinocchioPandaDynamics,
-    pos_weight: torch.Tensor,
-    orient_weight: torch.Tensor,
-    v_weight: torch.Tensor,
     u_weight: torch.Tensor,
 ):
-    """Batched, time-varying QuadCost using a shared goal schedule across batch.
+    """Vectorized QuadCost using flattened diagonal C and linear c terms.
 
-    For each time t in [0, T-1], selects the "next goal" index from
-    `goal_timesteps` (following build_ee_tracking_cost_runtime), then assembles
-    per-batch quadratic costs via EETrackingCostFn.
-
-    Args:
-      q_batch: [B, n_ctrl]
-      T: int horizon length
-      goal_timesteps: [K] long tensor (horizon-relative, can exceed T-1)
-      goal_positions: [B, K, 3]
-      goal_quaternions: [B, K, 4] (xyzw)
-      pos_weight, orient_weight, v_weight, u_weight: scalar or [B]
-    Returns QuadCost with C: [T, B, n_tau, n_tau], c: [T, B, n_tau]
-    """
-    assert x_batch.ndimension() == 2, "x_batch must be [B, n_state]"
-    B, n_state = x_batch.shape
-    device, dtype = x_batch.device, x_batch.dtype
-
-    ee_frame_id = dynamics.model.getFrameId("panda_hand")
-    n_ctrl = dynamics.nv
-    assert n_state == dynamics.nq + dynamics.nv, "x_batch second dim must match n_state"
-
-    # Require scalar weights for simplicity
-    assert pos_weight.ndimension() == 0
-    assert orient_weight.ndimension() == 0
-    assert v_weight.ndimension() == 0
-    assert u_weight.ndimension() == 0
-
-    K = goal_timesteps.size(0)
-    assert goal_positions.shape == (B, K, 3), "goal_positions must be [B,K,3]"
-    assert goal_quaternions.shape == (B, K, 4), "goal_quaternions must be [B,K,4] (xyzw)"
-
-    # Convert quaternions to rotation matrices once for the whole batch
-    goal_rot_mats = quat_xyzw_to_matrix(goal_quaternions.view(-1, 4)).view(B, K, 3, 3)
-
-    # Sort goal schedule indices once (shared across batch)
-    sort_idx = torch.argsort(goal_timesteps)
-    ts_sorted = goal_timesteps[sort_idx]
-
-    C_seq = []
-    c_seq = []
-    for t in range(T):
-        # find next goal index according to runtime builder's rule
-        idx = None
-        for k in range(K):
-            if t <= int(ts_sorted[k].item()):
-                idx = sort_idx[k]
-                break
-        if idx is None:
-            idx = sort_idx[-1]
-
-        Ct_b = []
-        ct_b = []
-        for b in range(B):
-            Cb, cb = EETrackingCostFn.apply(
-                x_batch[b],
-                goal_positions[b, idx],
-                goal_rot_mats[b, idx],
-                pos_weight,
-                orient_weight,
-                v_weight,
-                u_weight,
-                dynamics,
-                ee_frame_id,
-                n_state,
-                n_ctrl,
-            )
-            Ct_b.append(Cb)
-            ct_b.append(cb)
-
-        C_seq.append(torch.stack(Ct_b, dim=0))  # [B, n_tau, n_tau]
-        c_seq.append(torch.stack(ct_b, dim=0))  # [B, n_tau]
-
-    C_seq = torch.stack(C_seq, dim=0)  # [T, B, n_tau, n_tau]
-    c_seq = torch.stack(c_seq, dim=0)  # [T, B, n_tau]
-    return QuadCost(C_seq, c_seq)
-
-
-def build_joint_tracking_cost_batched_timevarying(
-    x_batch: torch.Tensor,
-    T: int,
-    goal_timesteps: torch.Tensor,
-    joint_goals: torch.Tensor,
-    dynamics: PinocchioPandaDynamics,
-    q_weight: torch.Tensor,
-    v_weight: torch.Tensor,
-    u_weight: torch.Tensor,
-):
-    """Batched, time-varying QuadCost for joint-space tracking.
-
-    Cost per step: 0.5*q_w*||q - q_des||^2 + 0.5*v_w*||v||^2 + 0.5*u_w*||u||^2
+    Cost per step: 0.5 * x^T * diag(exp(diag_C[t])) * x + c[t]^T * x + 0.5*u_w*||u||^2
 
     Args:
       x_batch: [B, n_state]
       T: horizon length
-      goal_timesteps: [K] long tensor (absolute/horizon-relative indices)
-      joint_goals: [B, K, n] desired joint angles
-      q_weight, v_weight, u_weight: scalar tensors
+      diag_C_flat: flattened log-space diagonal of C matrix, shape [n_state * T]
+      c_flat: flattened linear term, shape [n_state * T]
+      u_weight: scalar tensor for control cost
     Returns QuadCost with C: [T, B, n_tau, n_tau], c: [T, B, n_tau]
     """
     assert x_batch.ndimension() == 2
     B, n_state = x_batch.shape
     device, dtype = x_batch.device, x_batch.dtype
 
-    n = dynamics.nv
+    n_ctrl = dynamics.nv
     assert n_state == dynamics.nq + dynamics.nv
-
-    assert q_weight.ndimension() == 0
-    assert v_weight.ndimension() == 0
+    assert diag_C_flat.numel() == n_state * T
+    assert c_flat.numel() == n_state * T
     assert u_weight.ndimension() == 0
 
-    K = goal_timesteps.size(0)
-    assert joint_goals.shape == (B, K, n)
+    # Reshape flattened inputs to [T, n_state] and log normalize diag_C
+    diag_C = torch.exp(diag_C_flat.view(T, n_state)).to(device=device, dtype=dtype)
+    c_vec = c_flat.view(T, n_state).to(device=device, dtype=dtype)
 
-    # Sort schedule indices once
-    sort_idx = torch.argsort(goal_timesteps)
-    ts_sorted = goal_timesteps[sort_idx]
+    n_tau = n_state + n_ctrl
+    
+    # Fully vectorized construction
+    # Create C matrices: [T, B, n_tau, n_tau]
+    C_seq = torch.zeros(T, B, n_tau, n_tau, device=device, dtype=dtype)
+    
+    # State diagonal blocks: vectorized across all T and B
+    # Create diagonal matrices for all timesteps at once
+    diag_matrices = torch.diag_embed(diag_C)  # [T, n_state, n_state]
+    C_seq[:, :, :n_state, :n_state] = diag_matrices.unsqueeze(1).expand(-1, B, -1, -1)
+    
+    # Control block - same for all batches and timesteps
+    u_eye = u_weight * torch.eye(n_ctrl, device=device, dtype=dtype)
+    C_seq[:, :, n_state:, n_state:] = u_eye.unsqueeze(0).unsqueeze(0).expand(T, B, -1, -1)
 
-    C_seq = []
-    c_seq = []
-    Iq = torch.eye(n, device=device, dtype=dtype)
-    Iv = torch.eye(n, device=device, dtype=dtype)
-    Iu = torch.eye(n, device=device, dtype=dtype)
+    # Create c vectors: [T, B, n_tau]
+    c_seq = torch.zeros(T, B, n_tau, device=device, dtype=dtype)
+    
+    # State part: broadcast c_vec across batch dimension
+    c_seq[:, :, :n_state] = c_vec.unsqueeze(1).expand(-1, B, -1)
+    # Control part remains zero
 
-    for t in range(T):
-        # Select current goal index
-        idx = None
-        for k in range(K):
-            if t <= int(ts_sorted[k].item()):
-                idx = sort_idx[k]
-                break
-        if idx is None:
-            idx = sort_idx[-1]
-
-        Ct_b = []
-        ct_b = []
-        for b in range(B):
-            q_des = joint_goals[b, idx]  # [n]
-
-            # Assemble block-diagonal C and linear term c
-            C = torch.zeros(n_state + n, n_state + n, device=device, dtype=dtype)
-            # q block
-            C[0:n, 0:n] = q_weight * Iq
-            # v block
-            C[n:2*n, n:2*n] = v_weight * Iv
-            # u block
-            C[2*n:, 2*n:] = u_weight * Iu
-
-            c = torch.zeros(n_state + n, device=device, dtype=dtype)
-            c[0:n] = -q_weight * q_des
-
-            Ct_b.append(C)
-            ct_b.append(c)
-
-        C_seq.append(torch.stack(Ct_b, dim=0))
-        c_seq.append(torch.stack(ct_b, dim=0))
-
-    C_seq = torch.stack(C_seq, dim=0)
-    c_seq = torch.stack(c_seq, dim=0)
     return QuadCost(C_seq, c_seq)
 
 
-class PandaEETrackingMPCLayer(torch.nn.Module):
-    """Differentiable MPC layer for Panda joint-space tracking.
+class PandaMPCLayer(torch.nn.Module):
+    """Differentiable MPC layer for Panda with flattened diagonal cost terms.
 
     - Bakes in `dynamics` and horizon `T` at init time.
-    - Accepts per-batch joint goals and scalar weights at runtime.
-    - Maintains an absolute goal schedule (timesteps) and builds
-      a time-varying quadratic joint-space cost.
+    - Accepts flattened diagonal C and linear c terms for vectorized cost construction.
+    - Builds a time-varying quadratic cost: 0.5 * x^T * diag(C[t]) * x + c[t]^T * x
 
     Forward inputs
       x_init: [B, n_state]
-      joint_goals: [B, K, n]
-      q_weight, v_weight, u_weight: scalar tensors
+      diag_C_flat: [n_state * T] flattened log-space diagonal of cost matrix over trajectory
+      c_flat: [n_state * T] flattened linear cost term over trajectory
+      u_weight: scalar tensor for control cost
 
     Returns
       x_traj: [T, B, n_state]
@@ -620,13 +245,7 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
         self.n_state = self.dynamics.nq + self.dynamics.nv
         self.n_ctrl = self.dynamics.nv
 
-        # Absolute goal schedule and internal rollout step counter
-        # assert isinstance(goal_timesteps_abs, torch.Tensor) and goal_timesteps_abs.ndimension() == 1
-        # self.register_buffer('goal_timesteps_abs', goal_timesteps_abs.clone().long())
         self.register_buffer('rollout_step', torch.zeros((), dtype=torch.long))
-
-        # effort_max = self.dynamics.effort_limit.abs().unsqueeze(0).unsqueeze(0).repeat(T, 1, 1).to(dtype=torch.float)
-        # effort_min = -1. * effort_max
         effort_max = effort_min = None
 
         self.mpc = MPC(
@@ -649,39 +268,29 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
     def forward(
         self,
         x_init: torch.Tensor,
-        joint_goals: torch.Tensor,
-        goal_timesteps: torch.Tensor,
-        q_weight: torch.Tensor,
-        v_weight: torch.Tensor,
+        diag_C_flat: torch.Tensor,
+        c_flat: torch.Tensor,
         u_weight: torch.Tensor,
     ):
         assert x_init.ndimension() == 2 and x_init.size(1) == self.n_state
         B = x_init.size(0)
-        # Require scalar weights for simplicity
-        assert q_weight.ndimension() == 0
-        assert v_weight.ndimension() == 0
+        # diag_C_flat (log-space) and c_flat should be flattened (n_state * T,) vectors
+        assert diag_C_flat.ndimension() == 1 and diag_C_flat.numel() == self.n_state * self.T
+        assert c_flat.ndimension() == 1 and c_flat.numel() == self.n_state * self.T
         assert u_weight.ndimension() == 0
 
-        # Compute horizon-relative timesteps from absolute schedule and
-        # current internal rollout step.
-        # rel_ts = (self.goal_timesteps_abs - self.rollout_step).to(device=x_init.device)
-
-        cost = build_joint_tracking_cost_batched_timevarying(
+        cost = build_diagonal_cost_vectorized(
             x_batch=x_init,
             T=self.T,
-            goal_timesteps=goal_timesteps,
-            joint_goals=joint_goals,
+            diag_C_flat=diag_C_flat,
+            c_flat=c_flat,
             dynamics=self.dynamics,
-            q_weight=q_weight,
-            v_weight=v_weight,
             u_weight=u_weight,
         )
 
-        lin_dx = self._build_linear_dynamics(x_init, joint_goals, goal_timesteps, B)
+        lin_dx = self._build_linear_dynamics(x_init, B)
 
         x_traj, u_traj, costs = self.mpc(x_init, cost, lin_dx)
-        # Advance internal rollout step
-        # Detach costs to avoid backprop through extra LQRStep outputs
         return x_traj.transpose(0, 1), u_traj.transpose(0, 1), costs.detach()
 
     def reset_schedule(self, step: int = 0):
@@ -692,8 +301,6 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
     def _build_linear_dynamics(
         self,
         x_init: torch.Tensor,
-        joint_goals: torch.Tensor,
-        goal_timesteps: torch.Tensor,
         batch_size: int,
     ) -> LinDx:
         device = x_init.device
@@ -712,41 +319,9 @@ class PandaEETrackingMPCLayer(torch.nn.Module):
             q_nominal[0] = q0
             v_nominal[0] = v0
 
-            goal_ts_list = []
-            if goal_timesteps.numel() > 0:
-                goal_ts_list = [max(0, min(self.T - 1, int(ts))) for ts in goal_timesteps.tolist()]
-
-            goal_count = min(len(goal_ts_list), joint_goals.size(1))
-
-            if goal_count == 0:
-                for t in range(1, self.T):
-                    q_nominal[t] = q0
-            else:
-                goal_targets = joint_goals[:, :goal_count, :]
-
-                prev_time = 0
-                prev_q = q0
-                next_idx = 0
-                next_time = goal_ts_list[next_idx]
-                next_q = goal_targets[:, next_idx, :]
-
-                for t in range(1, self.T):
-                    while next_idx < goal_count and t > next_time:
-                        prev_time = next_time
-                        prev_q = next_q
-                        next_idx += 1
-                        if next_idx < goal_count:
-                            next_time = goal_ts_list[next_idx]
-                            next_q = goal_targets[:, next_idx, :]
-
-                    if next_idx >= goal_count:
-                        q_nominal[t] = prev_q
-                        continue
-
-                    denom = max(next_time - prev_time, 1)
-                    alpha = (t - prev_time) / float(denom)
-                    alpha = min(max(alpha, 0.0), 1.0)
-                    q_nominal[t] = (1.0 - alpha) * prev_q + alpha * next_q
+            # Simple nominal trajectory: stay at initial position
+            for t in range(1, self.T):
+                q_nominal[t] = q0
 
             dt = float(self.dynamics.dt)
             for t in range(1, self.T):
